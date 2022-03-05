@@ -1,0 +1,4 @@
+n_thread:4
+b_storage:100
+n_file_storage:100
+soc_filename:pasquale
