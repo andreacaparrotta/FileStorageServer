@@ -4,9 +4,11 @@
 #include <sys/types.h>
 #include <time.h>
 #include <stdlib.h>
+#include <limits.h>
 
 #include "api.h"
 
+#define SOCKETNAME ""
 #define TIMEOUT 500
 #define ABSTIME_OFFSET 5
 #define O_CREATE 1
@@ -25,7 +27,10 @@
 #define C_BIT 2
 #define P_BIT 1
 
+#define UNIX_PATH_MAX 108
+
 //Legge il contenuto della directory 'dirname' e invia i file contentuti al suo interno al server fino ad un massimo di n file
+//return il numero di byte scritti in caso di successo, -1 altrimenti
 int lower_w_fun(char *dirname, int n, char *save_dirname);
 
 //Legge i filename presenti in 'files' e invia i corrispondenti file al server
@@ -40,7 +45,9 @@ int main(int argc, char *argv[]) {
     char *D_dirname;
     char *d_dirname;
     char *w_dirname;
-    int n;
+    long n;
+    int success;
+    char *error;
 
     if(argc < 2) {
         return EINVAL;
@@ -56,14 +63,27 @@ int main(int argc, char *argv[]) {
             return 0;
         } else if(strcmp(argv[i], "-f") == 0) {
             if(arg_bit_mask & F_BIT) {
-                printf("-f can be used once only, use -h to see usage");
+                printf("-f can be used once only, use -h for help\n");
 
                 return -1;
             }
 
-            arg_bit_mask = arg_bit_mask | F_BIT;
+            if(argc > i+1 && argv[i+1][0] != '-') {
+                arg_bit_mask = arg_bit_mask | F_BIT;
+                sockname = argv[i+1];
 
-            i += 2;
+                i += 2;
+            } else {
+                printf("Socket filename not defined, use -h for help\n");
+
+                return -1;
+            }
+        } else if(strcmp(argv[i], "-D") == 0) {
+            if(argc > i+1 && argv[i+1][0] != '-') {
+                i += 2;
+            } else {
+                i++;
+            }
         } else if(strcmp(argv[i], "-w") == 0) {
             arg_bit_mask = arg_bit_mask | LOWER_W_BIT;
 
@@ -107,7 +127,7 @@ int main(int argc, char *argv[]) {
             i += 2;
         } else if(strcmp(argv[i], "-p") == 0) {
             if(arg_bit_mask & P_BIT) {
-                printf("-p can be used once only, use -h to see usage");
+                printf("-p can be used once only, use -h for help");
 
                 return -1;
             }
@@ -122,77 +142,119 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    fprintf(stderr, "IMPOSTAZIONE BIT MASK AVVENUTA CON SUCCESSO\n\n");
+    //Verifica se il socket filename è stato definito correttamente
+    if(!(arg_bit_mask & F_BIT)) {
+        printf("Socket filename not defined, use -h for help\n");
+
+        return -1;
+    }
+
+    //Usa l'api per aprire una connessione con il server
+    abstime.tv_sec = time(NULL) + ABSTIME_OFFSET;
+    if(openConnection(sockname, TIMEOUT, abstime)) {
+        perror("Opening connection with server");
+    }
 
     i = 1;
     while(i < argc) {
         if(strcmp(argv[i], "-f") == 0) {
-            //Verifica se il socket filename è specificato
-            if(argc > i+1 && argv[i+1][0] != '-') {
-                //Socket filename specificato, imposta il sockname
-                sockname = argv[i+1];
-
-                //Verifica la richiesta di modalità verbose
-                if(arg_bit_mask & P_BIT) {
-                    printf("Socket filename setted to: %s\n", sockname);
-                }
-
-                i += 2;
-            } else {
-                //Socket filename non specificato
-                printf("Socket filename not defined, please use -h for help\n");
-
-                i++;
+            //Verifica se è richiesta la modalità verbose
+            if(arg_bit_mask & P_BIT) {
+                printf("-f %s: Successful\n", sockname);
             }
+
+            i += 2;
         } else if(strcmp(argv[i], "-w") == 0) {
+            int result;
+            success = 0;
             //Verifica se la directory di cui caricare i file sul server è specificata
             if(argc > i+1 && argv[i+1][0] != '-') {
                 //Directory specificata
 
                 //Verifica se n è specificato
-                if(strstr(argv[i+1], ",") != NULL) {
+                if(strstr(argv[i+1], ",") == NULL) {
                     //n non specificato
                     w_dirname = argv[i+1];
 
                     n = -1;
                 } else {
                     //n specificato
+                    char *n_string;
 
                     w_dirname = strtok(argv[i+1], ",");
-                    n = (int)strtol(strtok(NULL, ",") + 3, NULL, 10);
-                }
 
-                //Verifica se l'argomento -D è specificato
-                if(argc > i+2 && strcmp(argv[i+2], "-D") != 0) {
-                    //-D non specificato
-                    D_dirname = NULL;
+                    n_string = strtok(NULL, ",");
 
-                    i += 3;
-                } else {
-                    //-D specificato
+                    if((n = strtol(n_string + 2, NULL, 10)) == LONG_MIN || n == LONG_MAX) {
+                        n = -2;
+                    }
 
-                    //Verifica se la directory per l'argomento -D è specificata
-                    if(argc > i+3 && argv[i+3][0] != '-') {
-                        D_dirname = argv[i+3];
-
-                        i += 4;
-                    } else {
-                        printf("Directory for -D argument not defined, please use -h for help\n");
-
-                        i += 3;
+                    if(n < 1) {
+                        error = "Invalid value for n";
+                        n = -2;
                     }
                 }
 
-                if(lower_w_fun(w_dirname, n, D_dirname)) {
-                    perror("Writing files from directory: ");
+                if(n != -2) {
+                    //Verifica se l'argomento -D è specificato
+                    if(argc > i+2 && strcmp(argv[i+2], "-D") != 0) {
+                        //-D non specificato
+                        D_dirname = NULL;
+
+                        i += 3;
+                    } else if(argc > i+2){
+                        //-D specificato
+
+                        //Verifica se la directory per l'argomento -D è specificata
+                        if(argc > i+3 && argv[i+3][0] != '-') {
+
+                            //Directory specificata
+                            D_dirname = argv[i+3];
+
+                            i += 4;
+
+                            //Elabora tutti i file da inviare al server
+                            if((result = lower_w_fun(w_dirname, n, D_dirname)) != -1) {
+                                success = 1;
+                            } else {
+                                perror("Writing files to server: ");
+                            }
+
+                        } else {
+                            //Directory non specificata
+                            error = "Directory for -D argument not defined";
+
+                            i += 3;
+                        }
+                    } else {
+                        i += 2;
+
+                        if((lower_w_fun(w_dirname, n, D_dirname)) != -1) {
+                            success = 1;
+                        } else {
+                            perror("Writing files to server");
+                        }
+
+                    }
+                } else {
+                    error = "Invalid value for n";
+
+                    i += 2;
                 }
             } else {
                 //Directory non specificata
-                printf("Directory path not defined, please use -h for help\n");
+                error = "Directory path not defined";
 
                 i++;
             }
 
+            if(arg_bit_mask & P_BIT) {
+                if(!success) {
+                    printf("-w %s: Unsuccessful: %s, use -h for help\n", w_dirname, error);
+                } else {
+                    printf("-w %s: Successfull byte written: %dbytes\n", w_dirname, result);
+                }
+            }
         } else if(strcmp(argv[i], "-W") == 0) {
 
         } else if(strcmp(argv[i], "-r") == 0) {
@@ -217,4 +279,66 @@ int main(int argc, char *argv[]) {
             i++;
         }
     }
+
+    //Usa l'api per chiudere la connessione con il server
+    if(closeConnection(SOCKETNAME)) {
+        perror("Closing connection with server");
+    }
+
+}
+
+int lower_w_fun(char *dirname, int n, char *save_dirname) {
+    DIR *dir;
+    struct dirent *dir_cont;
+
+    //Verifica se bisogna inviare altri file
+    if(n == 0) {
+        return 0;
+    }
+
+    //Apre la directory passata come argomento
+    if((dir = opendir(dirname)) == NULL) {
+        return -1;
+    }
+
+    //Scansiona il contenuto della directory
+    while((dir_cont = readdir(dir)) != NULL) {
+        //Verifica se dir_cont è un file regolare
+        if(dir_cont->d_type == DT_REG) {
+            //Usa l'api per aprire il file o crearlo
+            if(openFile(dir_cont->d_name, O_CREATE | O_LOCK) != 0) {
+                return -1;
+            }
+
+            //Usa l'api per scrivere il contenuto del file
+            if(writeFile(dir_cont->d_name, save_dirname)){
+                //C'è stato un errore nella scrittura elimina il file creato usando l'api
+                removeFile(dir_cont->d_name);
+
+                return -1;
+            } else {
+                //Usa l'api per chiudere il file
+                if(closeFile(dir_cont->d_name)) {
+                    return -1;
+                }
+            }
+        }
+    }
+
+    rewinddir(dir);
+
+    while((dir_cont = readdir(dir)) != NULL) {
+        //Verifica se dir_cont è una directory
+        if(dir_cont->d_type == DT_DIR) {
+            if(lower_w_fun(dir_cont->d_name, n, save_dirname)) {
+                return -1;
+            }
+        }
+    }
+
+    if(closedir(dir)) {
+        return -1;
+    }
+
+    return 0;
 }
