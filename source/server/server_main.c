@@ -10,8 +10,10 @@
 #include <pthread.h>
 #include <poll.h>
 #include <sys/un.h>
+#include <signal.h>
 
 #include "request_queue.h"
+#include "resolved_queue.h"
 #include "worker.h"
 
 #define CONFIG_PATH "./etc/"
@@ -21,6 +23,7 @@
 #define DEFAULT_CONFIG "n_thread:4\nb_storage:100\nn_file_storage:100\nsoc_filename:./server_socket\nmax_conn_wait:10"
 #define UNIX_PATH_MAX 108
 #define POLL_TIMEOUT 1000
+
 
 struct config_struct{
     int n_thread;                                                   //Numero di thread worker da avviare all'inizio dell'esecuzione del server
@@ -39,94 +42,148 @@ struct pollfd *init_fds(struct pollfd *fds, int max);
 
 void add_fd(struct pollfd *fds, int fd, int max);
 
+int close_conn(struct pollfd *fds, int fd, int max);
+
 void add_queue(struct pollfd *fds, int n, int maxconn, request_queue_el **head, request_queue_el **tail);
 
 int main(int argc, char *argv[]){
     config config;
 
-    int fd_socket, n_fd_socket, i;
-    int terminate = 0, poll_result;
+    int fd_socket, n_fd_socket;
+
+    int terminate = 0, poll_result, i;
     int active_conn = 0;
 
     struct sockaddr_un socket_addr;
     struct pollfd *fds;
 
-    request_queue_el *head = NULL, *tail = NULL;
+    request_queue_el *head_request = NULL, *tail_request = NULL;
+    resolved_queue_el *head_resolved = NULL, *tail_resolved = NULL;
 
     pthread_t *workers;
-    pthread_t manager;
 
-    socklen_t addr_size;
+    worker_arg *args;
+
+    resolved_queue_el resolved;
 
     config = parse_config();
 
     printf("Loaded following configuration from config.txt:\n");
-    printf("Worker thread number: %d\nBuffer size: %dMbytes\nMax files number: %d\nSocket filename: %s\nMax connection limit: %d\n", config.n_thread, config.b_storage, config.n_file_storage, config.soc_filename, config.max_conn_wait);
+    printf("Worker thread number: %d\nBuffer size: %dMbytes\nMax files number: %d\nSocket filename: %s\nMax connection limit: %d\n\n", config.n_thread, config.b_storage, config.n_file_storage, config.soc_filename, config.max_conn_wait);
 
-    workers = malloc(config.n_thread * sizeof(pthread_t));
-
-    //Crea e avvia i thread worker del thread pool
-    for(i = 0; i < config.n_thread; i++) {
-        if((errno = pthread_create(&(workers[i]), NULL, &main_worker, &head)) != 0) {
-            perror("Creating worker threads");
-        }
-    }
-
-    sleep(1);
-
-    printf("Thread pool created\n");
-
-    //Crea un socket non bloccante
+    /*
+     * Crea un socket non bloccante
+     */
     fd_socket = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
 
     socket_addr.sun_family = AF_UNIX;
     strncpy(socket_addr.sun_path, config.soc_filename, UNIX_PATH_MAX);
 
-    addr_size = sizeof(socket_addr);
-
-    if(bind(fd_socket,(struct sockaddr *) &socket_addr, addr_size)) {
-        perror("Binding socket");
+    if(bind(fd_socket,(struct sockaddr *) &socket_addr, sizeof(socket_addr))) {
+        perror("MANAGER: Binding socket");
 
         return -1;
     }
 
     if(listen(fd_socket, config.max_conn_wait)) {
-        perror("Listen on socket");
+        perror("MANAGER: Listen on socket");
 
         return -1;
     }
 
-    printf("Socket created\n");
+    printf("MANAGER: Socket created\n");
 
+    /*
+     * Alloca e inizializza l'array che contiene i file descriptor delle connessioni aperte
+     */
     fds = malloc(config.max_conn_wait * sizeof(struct pollfd));
-
     fds = init_fds(fds, config.max_conn_wait);
 
-    while(!terminate) {
-        n_fd_socket = accept(fd_socket, (struct sockaddr *) &socket_addr, (socklen_t *) &addr_size);
+    /*
+     * Alloca l'array per contenere i thread worker presenti nel thread pool
+     */
+    workers = malloc(config.n_thread * sizeof(pthread_t));
 
+    args = malloc(sizeof(worker_arg));
+
+    args->head_request = &head_request;
+    args->head_resolved = &head_resolved;
+    args->tail_resolved = &tail_resolved;
+
+    /*
+     * Crea e avvia i thread worker del thread pool
+     */
+    for(i = 0; i < config.n_thread; i++) {
+        args->thread_n = i;
+        
+        if((errno = pthread_create(&(workers[i]), NULL, &main_worker, args)) != 0) {
+            perror("MANAGER: Creating worker threads");
+        }
+    }
+
+    sleep(1);
+
+    free(args);
+
+    printf("MANAGER: Thread pool created\n");
+
+    while(!terminate) {
+        /*
+         * Accetta una nuova connessione
+         */
+        n_fd_socket = accept(fd_socket, NULL, 0);
+
+        /*
+         * Verifica se la richiesta di connessione è stata accettata
+         */
         if(n_fd_socket == -1) {
             if(errno != EAGAIN) {
-                perror("Accepting connection on socket");
+                perror("MANAGER: Accepting connection on socket");
             }
         } else {
-            printf("Accepted new request\n");
+            printf("MANAGER: Accepted new request\n");
 
             add_fd(fds, n_fd_socket, config.max_conn_wait);
 
             active_conn++;
         }
 
+        /*
+         * Verifica se qualche connessione è pronta per poter essere letta
+         */
         poll_result = poll(fds, active_conn, POLL_TIMEOUT);
 
         if(poll_result == -1) {
-            perror("Polling:");
+            perror("MANAGER: Polling");
         }
 
         if(poll_result > 0) {
-            add_queue(fds, poll_result, config.max_conn_wait, &head, &tail);
+            /*
+             * Aggiunge eventuali nuove richieste nella coda delle richieste
+             */
+            add_queue(fds, poll_result, config.max_conn_wait, &head_request, &tail_request);
+        }
+
+        errno = 0;
+        resolved = pop_resolved(&head_resolved);
+        while(resolved.resolved_fd != -1) {
+            if(resolved.close) {
+                close_conn(fds, resolved.resolved_fd, config.max_conn_wait);
+
+                active_conn--;
+            } else {
+                add_fd(fds, resolved.resolved_fd, config.max_conn_wait);
+            }
+
+            resolved = pop_resolved(&head_resolved);
+        }
+
+        if(resolved.resolved_fd == -1 && errno != 0) {
+            perror("MANAGER: Reading resolved queue");
         }
     }
+
+    close(fd_socket);
 
     free(fds);
 }
@@ -215,25 +272,61 @@ struct pollfd *init_fds(struct pollfd *fds, int max) {
 }
 
 void add_fd(struct pollfd *fds, int fd, int max) {
-    int i = 0;
+    int i = 0, find = 0;
 
-    while(i < max && fds[i].fd != -1) {
+    while(i < max && fds[i].fd != fd) {
         i++;
     }
 
-    fds[i].fd = fd;
-    fds[i].events = POLLIN;
+    if(fds[i].fd == fd) {
+        fds[i].events = POLLIN;
+
+        find = 1;
+    }
+
+    if(!find) {
+        i = 0;
+
+        while(i < max && fds[i].fd != -1) {
+            i++;
+        }
+
+        fds[i].fd = fd;
+        fds[i].events = POLLIN;
+    }
+}
+
+int close_conn(struct pollfd *fds, int fd, int max) {
+    int i = 0;
+
+    while(i < max && fds[i].fd != fd) {
+        i++;
+    }
+
+    if(fds[i].fd == fd) {
+        fds[i].fd = -1;
+        fds[i].events = 0;
+
+        return 0;
+    }
+
+    return -1;
 }
 
 void add_queue(struct pollfd *fds, int n, int maxconn, request_queue_el **head, request_queue_el **tail) {
     int find = 0, i = 0;
+    request_queue_el *push_result;
 
     while(find < n && i < maxconn) {
 
         if((fds[i].events & POLLIN) && (fds[i].revents & POLLIN) && !exist_fd(*head, fds[i].fd)) {
-            *tail = push_request(head, *tail, fds[i].fd);
+
+            if((push_result = push_request(head, tail, fds[i].fd)) == NULL) {
+                perror("MANAGER: Pushing new request");
+            }
 
             fds[i].events = POLLOUT;
+            fds[i].revents = 0;
 
             find++;
         }
