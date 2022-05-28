@@ -1,4 +1,18 @@
-n_thread:4
-b_storage:100
+# Il numero di thread che compongono il thread pool
+n_thread:8
+# La dimensione massima dello storage espressa in Mbyte
+b_storage:32
+# Il numero massimo di file che possono essere presenti contemporaneamente nello storage
 n_file_storage:100
-soc_filename:pasquale
+# Il filename del socket di ascolto del server
+soc_filename:./etc/server_socket
+# Il numero massimo di connessioni in attesa di essere accettate
+max_conn_wait:10
+# Il numero massimo di connessioni attive contemporaneamente
+max_active_conn:20
+# Il timeout di attesa del server
+manager_timeout:10
+# Il file name del file di log
+log_filename:./etc/log.txt
+# Il timeout per chiudere le connessioni inutilizzate con i client, specificato in secondi
+client_timeout:60
